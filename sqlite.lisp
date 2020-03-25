@@ -30,9 +30,12 @@
            :execute-one-row-m-v
            :last-insert-rowid
            :with-transaction
-           :with-open-database))
+           :with-open-database
+           :*strictly-bind-parameters*))
 
 (in-package :sqlite)
+
+(defvar *strictly-bind-parameters* t)
 
 (define-condition sqlite-error (simple-error)
   ((handle     :initform nil :initarg :db-handle
@@ -243,6 +246,26 @@ Returns:
               ,@body)
          (finalize-statement ,statement-var)))))
 
+(defmacro with-prepared-statement/strict (statement-var (db sql parameters-var) &body body)
+  (let ((i-var (gensym "I"))
+        (value-var (gensym "VALUE"))
+        (params-var (gensym "PARAMS")))
+    `(let* ((,statement-var (prepare-statement ,db ,sql))
+            (,params-var (sqlite-ffi:sqlite3-bind-parameter-count (handle ,statement-var))))
+       (unwind-protect
+         (progn
+           (if *strictly-bind-parameters*
+             (when (/= ,params-var (length ,parameters-var))
+                         (sqlite-error nil "Parameters count does not match the query."))
+             (setq ,params-var (min ,params-var (length , parameters-var))))
+           (iter (for ,i-var from 1 
+                      to ,params-var)
+                 (declare (type fixnum ,i-var))
+                 (for ,value-var in ,parameters-var)
+                 (bind-parameter ,statement-var ,i-var ,value-var))
+           ,@body)
+         (finalize-statement ,statement-var)))))
+
 (defmacro with-prepared-statement/named (statement-var (db sql parameters-var) &body body)
   (let ((name-var (gensym "NAME"))
         (value-var (gensym "VALUE")))
@@ -263,7 +286,7 @@ Example:
 
 See BIND-PARAMETER for the list of supported parameter types."
   (declare (dynamic-extent parameters))
-  (with-prepared-statement statement (db sql parameters)
+  (with-prepared-statement/strict statement (db sql parameters)
     (step-statement statement)))
 
 (defun execute-non-query/named (db sql &rest parameters)
@@ -292,10 +315,22 @@ Example:
 
 See BIND-PARAMETER for the list of supported parameter types."
   (declare (dynamic-extent parameters))
-  (with-prepared-statement stmt (db sql parameters)
+  (with-prepared-statement/strict stmt (db sql parameters)
     (let (result)
       (loop (if (step-statement stmt)
                 (push (iter (for i from 0 below (the fixnum (sqlite-ffi:sqlite3-column-count (handle stmt))))
+                            (declare (type fixnum i))
+                            (collect (statement-column-value stmt i)))
+                      result)
+                (return)))
+      (nreverse result))))
+
+(defun execute-to-list-lax (db sql &rest parameters)
+  (with-prepared-statement-lax stmt (db sql parameters)
+    (let (result)
+      (loop (if (step-statement stmt)
+                (push (iter (for i from 0 below 
+                                      (the fixnum (sqlite-ffi:sqlite3-column-count (handle stmt))))
                             (declare (type fixnum i))
                             (collect (statement-column-value stmt i)))
                       result)
@@ -413,7 +448,7 @@ Example:
 
 See BIND-PARAMETER for the list of supported parameter types."
   (declare (dynamic-extent parameters))
-  (with-prepared-statement stmt (db sql parameters)
+  (with-prepared-statement/strict stmt (db sql parameters)
     (if (step-statement stmt)
         (statement-column-value stmt 0)
         nil)))
